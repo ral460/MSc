@@ -1,14 +1,20 @@
 import numpy as np
-import pandas as pd
-import math
-import networkx as nx
-import matplotlib.pyplot as plt
 from sklearn.linear_model import Lasso
 import time
 import sys
 from scipy.optimize import minimize
 from datetime import timedelta
-from numpy.linalg import norm
+from scipy.stats import norm
+from scipy.linalg import block_diag, det, inv
+from numpy.linalg import slogdet
+
+
+# import pandas as pd
+# import math
+# import networkx as nx
+# import matplotlib.pyplot as plt
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 # Epanechnikov kernel function
 def Epanechnikov(u):
@@ -316,7 +322,7 @@ def local_linear_weights(tau_t_values, tau, bandwidth):
     Returns:
     - delta_n_t: Local linear weights for each time point t.
     """
-    n = len(tau_t_values)
+    
     u = (tau_t_values - tau) / bandwidth  # Normalized time differences
     
     # Compute the kernel terms
@@ -418,6 +424,109 @@ def clime_estimation(Sigma_tau, lambda_3):
 
 
 
+# EBIC objective function
+def EBIC(lambda_3, omega_tau, sigma_tau, n_e, d):
+    """
+    Compute the EBIC for a given lambda_3.
+    
+    Parameters:
+    - lambda_3: The tuning parameter for CLIME estimation.
+    - omega_tau: The time-varying precision matrix estimate Ω(tau).
+    - sigma_tau: The time-varying covariance matrix estimate Σ(tau).
+    - n_e: Effective sample size.
+    - d: Number of variables (dimension of Ω and Σ).
+
+    Returns:
+    - EBIC_value: The EBIC value for the given λ3.
+    """
+    det_omega = np.linalg.det(omega_tau)
+    trace_term = np.trace(np.dot(omega_tau, sigma_tau))
+
+    # Count the number of non-zero elements in omega_tau
+    non_zero_elements = np.sum(np.abs(omega_tau) > 0)
+
+    # EBIC formula (E.3)
+    EBIC_value = -np.log(det_omega) + trace_term + (np.log(n_e) / n_e) * non_zero_elements
+
+    return EBIC_value
+
+# Grid search for lambda_3
+def grid_search_lambda3(sigma_tau_list, tau_t_values, h, lambda_grid):
+    """
+    Perform a grid search over lambda_3 to minimize the EBIC.
+    
+    Parameters:
+    - sigma_tau_list: List of estimated covariance matrices Σ(tau).
+    - tau_t_values: Array of normalized time points.
+    - h: Bandwidth parameter.
+    - lambda_grid: Grid of lambda_3 values to search over.
+    
+    Returns:
+    - optimal_lambda3: The lambda_3 that minimizes the EBIC.
+    """
+    d = sigma_tau_list[0].shape[0]  # Dimension of the matrices
+    best_lambda3 = None
+    best_EBIC_value = np.inf
+
+    # Iterate over the grid of lambda_3 values
+    for lambda_3 in lambda_grid:
+        total_EBIC_value = 0
+
+        for tau_idx, tau in enumerate(tau_t_values):
+            sigma_tau = sigma_tau_list[tau_idx]
+            omega_tau = estimate_precision_matrices(sigma_tau, lambda_3)
+
+            # Compute the effective sample size n_e
+            n_e = effective_sample_size(tau_t_values, tau, h)
+
+            # Compute EBIC for this tau and lambda_3
+            EBIC_value = EBIC(lambda_3, omega_tau, sigma_tau, n_e, d)
+            total_EBIC_value += EBIC_value
+
+        # Keep track of the best lambda_3
+        if total_EBIC_value < best_EBIC_value:
+            best_lambda3 = lambda_3
+            best_EBIC_value = total_EBIC_value
+
+    return best_lambda3
+
+# Refine with optimization
+def optimize_lambda3(sigma_tau_list, tau_t_values, h, initial_lambda3):
+    """
+    Perform precise optimization for lambda_3 starting from the best value found via grid search.
+    
+    Parameters:
+    - sigma_tau_list: List of estimated covariance matrices Σ(tau).
+    - tau_t_values: Array of normalized time points.
+    - h: Bandwidth parameter.
+    - initial_lambda3: The lambda_3 found from the grid search.
+    
+    Returns:
+    - optimal_lambda3: The refined lambda_3 that minimizes the EBIC.
+    """
+    d = sigma_tau_list[0].shape[0]  # Dimension of the matrices
+
+    # Define the objective function to minimize (total EBIC over all tau_t_values)
+    def objective(lambda_3):
+        total_EBIC_value = 0
+
+        for tau_idx, tau in enumerate(tau_t_values):
+            sigma_tau = sigma_tau_list[tau_idx]
+            omega_tau = estimate_precision_matrices(sigma_tau, lambda_3)
+
+            # Compute the effective sample size n_e
+            n_e = effective_sample_size(tau_t_values, tau, h)
+
+            # Compute EBIC for this tau and lambda_3
+            EBIC_value = EBIC(lambda_3, omega_tau, sigma_tau, n_e, d)
+            total_EBIC_value += EBIC_value
+
+        return total_EBIC_value
+
+    # Use a bounded optimization method to refine lambda_3
+    result = minimize(objective, initial_lambda3, bounds=[(0.001, 10)], method='L-BFGS-B')
+
+    return result.x[0]
 
 
 
@@ -707,12 +816,162 @@ def compute_penalized_objective(preliminary_a, preliminary_b, D_hat, X, Xt_1, ta
 
 
 
-    '''
-    3-step procedure
-    '''
 
+# Simulate VAR(1) data as in example 1 of CLIME paper
+def simulate_var1_example1(n, d, tau_t_values):
+    """
+    Simulates time-varying VAR(1) data.
+    
+    Parameters:
+    - n: Number of time points.
+    - d: Number of variables (should be even).
+    - tau_t_values: Array of normalized time points (n values in [0, 1]).
+    
+    Returns:
+    - X: Simulated VAR(1) data of shape (n, d).
+    """
 
+    if d % 2 != 0:
+        raise ValueError("d must be an even number since the covariance matrix is block diagonal.")
 
+    # Initialize the data matrix X
+    X = np.zeros((n, d))
+
+    # Simulate A1(τ) as a diagonal matrix with values based on Φ(5(τ − 1/2))
+    A1_tau_diag = np.zeros((n, d))
+
+    for t in range(n):
+        tau = tau_t_values[t]
+        for i in range(d):
+            phi_val = 0.64 * norm.cdf(5 * (tau - 0.5))
+            if np.random.rand() < 0.5:
+                A1_tau_diag[t, i] = phi_val
+            else:
+                A1_tau_diag[t, i] = 0.64 - phi_val
+
+    # Set Ω(τ) as block diagonal: Ω(τ) = Id/2 ⊗ Ω*(τ)
+    def Omega_star_tau(tau):
+        """
+        Creates the 2x2 block Ω*(τ) for a given τ.
+        """
+        omega_11_22 = 1.0
+        omega_12_21 = 1.4 * norm.cdf(5 * (tau - 0.5)) - 0.7
+        Omega_star = np.array([[omega_11_22, omega_12_21], [omega_12_21, omega_11_22]])
+        return Omega_star
+
+    # Construct Ω(τ) by placing Ω*(τ) on the diagonal blocks
+    Omega_tau_list = []
+    for t in range(n):
+        tau = tau_t_values[t]
+        Omega_tau = np.zeros((d, d))
+        Omega_star = Omega_star_tau(tau)
+        for i in range(0, d, 2):
+            Omega_tau[i:i+2, i:i+2] = Omega_star
+        Omega_tau_list.append(Omega_tau)
+
+    # Simulate data X from the VAR(1) model
+    for t in range(1, n):
+        A1_tau_t = np.diag(A1_tau_diag[t])
+        Sigma_tau_t = Omega_tau_list[t]
+        epsilon_t = np.random.multivariate_normal(np.zeros(d), Sigma_tau_t)
+        X[t] = A1_tau_t @ X[t - 1] + epsilon_t
+
+    return X, A1_tau_diag, Omega_tau_list
+
+# Simulate VAR(1) data as in example 2 of CLIME paper
+def simulate_var1_example2(n, d, tau_t_values):
+    """
+    Simulates time-varying VAR(1) data with A1(τ) being an upper triangular matrix and Ω(τ) being a banded symmetric matrix.
+    
+    Parameters:
+    - n: Number of time points.
+    - d: Number of variables (should be even).
+    - tau_t_values: Array of normalized time points (n values in [0, 1]).
+    
+    Returns:
+    - X: Simulated VAR(1) data of shape (n, d).
+    """
+
+    if d % 2 != 0:
+        raise ValueError("d should be even.")
+
+    # Initialize the data matrix X
+    X = np.zeros((n, d))
+
+    # Loop through each time point
+    for t in range(1, n):
+        tau = tau_t_values[t]
+        
+        # Construct the time-varying A1(τ) matrix
+        A1_tau = np.zeros((d, d))
+        for i in range(d):
+            # Diagonal entry
+            A1_tau[i, i] = 0.7 * norm.cdf(5 * (tau - 0.5))
+            if i < d - 1:
+                # Super-diagonal entry
+                A1_tau[i, i + 1] = 0.7 - 0.7 * norm.cdf(5 * (tau - 0.5))
+
+        # Generate time-varying noise epsilon_t
+        Omega_tau = np.eye(d)
+        for i in range(d - 1):
+            Omega_tau[i, i + 1] = 0.7 * norm.cdf(5 * (tau - 0.5)) - 0.7
+            Omega_tau[i + 1, i] = Omega_tau[i, i + 1]  # Symmetry
+
+        for i in range(d - 2):
+            Omega_tau[i, i + 2] = 0.7 - 0.7 * norm.cdf(5 * (tau - 0.5))
+            Omega_tau[i + 2, i] = Omega_tau[i, i + 2]  # Symmetry
+
+        # Sample epsilon_t from the multivariate normal with covariance Omega_tau
+        epsilon_t = np.random.multivariate_normal(np.zeros(d), Omega_tau)
+
+        # Update X_t based on X_(t-1)
+        X[t] = A1_tau @ X[t - 1] + epsilon_t
+
+    return X
+
+# Simulate VAR(1) data as in example 3 of CLIME paper
+def simulate_var1_example3(n, d, tau_t_values):
+    """
+    Simulate data from a time-varying VAR(1) model where A1(τ) and Ω(τ) are Toeplitz matrices.
+
+    Parameters:
+    - n: Number of time points
+    - d: Number of dimensions (variables)
+    - tau_t_values: Array of normalized time points (n values)
+    
+    Returns:
+    - X: Simulated data matrix of shape (n, d)
+    """
+
+    # Initialize the data matrix
+    X = np.zeros((n, d))
+
+    # Simulate A1(τ) and Ω(τ) at each time point τ
+    for t in range(1, n):
+        tau = tau_t_values[t]
+
+        # A1(τ) is a Toeplitz matrix with entries a_ij(τ) = (0.4 - 0.1τ)^|i-j|+1
+        A1_tau = np.zeros((d, d))
+        for i in range(d):
+            for j in range(d):
+                A1_tau[i, j] = (0.4 - 0.1 * tau)**(abs(i - j) + 1)
+        
+        # Ω(τ) is a Toeplitz matrix with entries ω_ij(τ) = (0.8 - 0.1τ)^|i-j|
+        Omega_tau = np.zeros((d, d))
+        for i in range(d):
+            for j in range(d):
+                Omega_tau[i, j] = (0.8 - 0.1 * tau)**abs(i - j)
+
+        # Generate multivariate normal noise with covariance matrix Ω(τ)^(-1)
+        Sigma_tau = np.linalg.inv(Omega_tau)
+        epsilon_t = np.random.multivariate_normal(np.zeros(d), Sigma_tau)
+
+        # Generate the data at time t using the VAR(1) model
+        X[t, :] = A1_tau @ X[t - 1, :] + epsilon_t
+
+    return X
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 # First step
 def firstStep(X, λ_values, tau_t_values, h):
@@ -790,7 +1049,7 @@ def secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0,
     return alpha_estimates, beta_estimates
 
 # Third step
-def thirdStep(X, alpha_estimates, tau_t_values, bandwidth):
+def thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values):
     residuals = estimate_residuals_with_estimated_A(X, alpha_estimates, p=1)
 
     # Print the shape and first few residuals for inspection
@@ -802,8 +1061,14 @@ def thirdStep(X, alpha_estimates, tau_t_values, bandwidth):
     # Print the first time-varying covariance matrix for inspection
     print("First time-varying covariance matrix Σ(tau) at tau = 0:\n", sigma_tau_list[0])
 
-    lambda_3 = 0.1  # You can adjust this value
-    omega_tau_list = estimate_precision_matrices(sigma_tau_list, lambda_3)
+    # Grid search for lambda_3
+    initial_lambda3 = grid_search_lambda3(sigma_tau_list, tau_t_values, bandwidth, λ_values)
+
+    # Refine with optimization
+    optimal_lambda3 = optimize_lambda3(sigma_tau_list, tau_t_values, bandwidth, initial_lambda3)
+
+    # Estimate precision matrices with the optimal lambda_3
+    omega_tau_list = estimate_precision_matrices(sigma_tau_list, optimal_lambda3)
 
     # Print the first time-varying precision matrix for inspection
     print("First time-varying precision matrix Ω(tau) at tau = 0:\n", omega_tau_list[0])        
@@ -816,12 +1081,16 @@ def thirdStep(X, alpha_estimates, tau_t_values, bandwidth):
     
     return omega_sym_list
 
+
+
+
+
 # Main
 def main():
 
     # Define parameters
     n = 10  # Number of observations
-    d = 20  # Number of variables
+    d = 4  # Number of variables
     tau_t_values = np.linspace(0, 1, n) # Create normalized time points tau_t
     h = 0.75 * (np.log(d) / n) ** (1/5) # Bandwidth for kernel as in Li, Ke and Zhang (2015)
     bandwidth = h  # also as in Li, Ke and Zhang (2015).
@@ -829,11 +1098,25 @@ def main():
     a0 = 3.7 # as suggested in Fan and Li (2001)
     kmax = 3 # maximum lag order used for the estimation
 
-    # Generate example data
-    X = np.random.randn(n, d)  # Random data as placeholder (replace with real data)
+    simulate = True
+    
+    # Data used
+    data = 1
 
-    # Use real data and n,d are the shape of the data, X is the data
+    # Simulate the data
+    if(simulate == True):
+        if(data == 1):
+            X, A1_tau_diag, Omega_tau_list = simulate_var1_example1(n, d, tau_t_values)
+        elif(data == 2):
+            X, A1_tau_diag, Omega_tau_list = simulate_var1_example2(n, d, tau_t_values)
+        elif(data == 3):
+            X, A1_tau_diag, Omega_tau_list = simulate_var1_example3(n, d, tau_t_values)
+        
+    # Print the first few rows of the simulated data
+    print(X[:5])
 
+    sys.exit()
+    
     '''
     3.1: Preliminary time-varying LASSO estimation
     '''
@@ -847,18 +1130,16 @@ def main():
     '''
     3.3: Estimation of the time-varying precision matrix
     '''
-    estimatedPrecisionMatrices = thirdStep(X, alpha_estimates, tau_t_values, bandwidth)
-
+    estimatedPrecisionMatrices = thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values)
+    
+    print(estimatedPrecisionMatrices)
 
     '''
     Select lag order
     '''
     select_lag(kmax, n, d, alpha_estimates)
-
-    
-    
-    
-###########################################################
+   
+#################################################################################################
 ### Call main
 if __name__ == "__main__":
     start_time = time.monotonic()

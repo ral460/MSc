@@ -5,16 +5,15 @@ import sys
 from scipy.optimize import minimize
 from datetime import timedelta
 from scipy.stats import norm
-from scipy.linalg import block_diag, det, inv
-from numpy.linalg import slogdet
 
-
+# from scipy.linalg import block_diag, det, inv
+# from numpy.linalg import slogdet
 # import pandas as pd
 # import math
 # import networkx as nx
 # import matplotlib.pyplot as plt
 
-''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 # Epanechnikov kernel function
 def Epanechnikov(u):
@@ -78,6 +77,122 @@ def effective_sample_size(tau_t_values, tau, bandwidth):
     
     return n_e
 
+# BIC
+def BIC_i(λ1, alpha_hat, beta_hat, tau, tau_t_values, X, Xt_1, h):
+    """
+    Compute the Bayesian Information Criterion (BIC) for the given estimates of alpha and beta.
+    
+    Parameters:
+    - λ1: Tuning parameter for LASSO.
+    - alpha_hat: Estimated alpha coefficients.
+    - beta_hat: Estimated beta coefficients.
+    - tau: Target time point.
+    - tau_t_values: Time points.
+    - X: Response matrix (n × d).
+    - Xt_1: Lagged predictors (n-1 × d).
+    - h: Bandwidth for kernel smoothing.
+    
+    Returns:
+    - BIC value.
+    """
+    n, d = X.shape
+    
+    # Compute the effective sample size n_e
+    n_e = effective_sample_size(tau_t_values, tau, h)
+    
+    # Compute the kernel weights for all time points
+    weights = kernel_weights(tau_t_values, tau, h)
+    
+    # Initialize the likelihood term
+    L_i = 0
+    
+    # Compute the likelihood term (L_i)
+    for t in range(1,n):
+        y_t = X[t, :]
+        # Compute the predicted value based on the formula
+        # alpha_hat is (d x d), beta_hat is (d x d), and Xt_1[t] is (d,)
+        # We compute predicted_t for each variable, i.e., row-wise
+        predicted = np.zeros(d)
+        
+        for j in range(d):
+            # Extract the j-th column from alpha_hat and beta_hat, and the j-th row of Xt_1
+            alpha_hat_j = alpha_hat[:, j]  # shape (d,)
+            beta_hat_j = beta_hat[:, j]    # shape (d,)
+            Xt_1_j = Xt_1[t - 1]              # shape (d,)
+            
+            # Compute predicted value for the j-th variable
+            predicted[j] = (alpha_hat_j + beta_hat_j * (tau_t_values[t] - tau)) @ Xt_1_j  # element-wise multiplication followed by dot product
+            
+        # Calculate residual
+        residual = y_t - predicted
+    
+        # Update the likelihood with the weighted residual
+        L_i += np.sum(residual ** 2) * weights[t]
+
+    # Normalize by the total number of observations
+    L_i /= n
+    
+    # Number of non-zero coefficients (used in BIC penalty)
+    non_zero_alpha = np.count_nonzero(alpha_hat)
+    non_zero_beta = np.count_nonzero(beta_hat)
+    
+    # Compute the BIC
+    BIC_value = np.log(L_i / np.sum(weights[1:])) + ((np.log(n_e) / n_e)) * (non_zero_alpha + non_zero_beta)
+    
+    return BIC_value
+
+# Local linear LASSO
+def local_linear_lasso(X, Xt_1, tau, tau_t, h, lambda_1):
+    """
+    Perform local linear regression with LASSO regularization.
+    
+    Parameters:
+    - X: (n × d) matrix of observations (response data).
+    - Xt_1: (n-1 × d) matrix of lagged predictors.
+    - tau: Target time for local regression (scalar in [0, 1]).
+    - tau_t: Normalized time points (n × 1 array).
+    - h: Bandwidth parameter for kernel smoothing.
+    - λ: Regularization parameter for LASSO.
+    
+    Returns:
+    - Estimated alpha and beta parameters for each variable.
+    """
+    n, d = X.shape
+    alpha_results = []  # List to store alpha estimates for each time point
+    beta_results = []  # List to store beta estimates for each time point
+
+    # For each variable i, we will estimate alpha and beta
+    for i in range(d):
+        # Step 1: Create the response vector and the design matrix
+        y = X[1:, i]  # Response vector for variable i (exclude the first row)
+        design_matrix = np.hstack([Xt_1, (tau_t[1:] - tau).reshape(-1, 1) * Xt_1])
+        
+        # Step 2: Calculate kernel weights
+        weights = kernel_weights(tau_t[1:], tau, h)  # Kernel weights for each time point (exclude first)
+        
+        # Step 3: Perform weighted least squares using LASSO
+        weighted_design_matrix = design_matrix * np.sqrt(weights).reshape(-1, 1)
+        weighted_y = y * np.sqrt(weights)
+        
+        # Step 4: Custom LASSO with separate penalties for alpha and beta
+        scaling_factor = np.hstack([np.ones(d), h * np.ones(d)])  # alpha penalized by λ, beta by hλ
+        scaled_design_matrix = weighted_design_matrix / scaling_factor
+        
+        # Step 5: Fit LASSO (L1 regularized linear regression)
+        lasso = Lasso(alpha=lambda_1, fit_intercept=False)
+        lasso.fit(scaled_design_matrix, weighted_y)
+        
+        # Step 6: Extract the coefficients (alpha and beta)
+        alpha = lasso.coef_[:d]  # First d coefficients correspond to alpha
+        beta = lasso.coef_[d:] / h  # Next d coefficients correspond to beta (scaled back by h)
+        
+        # Store the result for the current variable i
+        alpha_results.append(alpha)
+        beta_results.append(beta)
+    
+    return np.array(alpha_results), np.array(beta_results)
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 # SCAD penalty derivative
 def scad_penalty_derivative(lambda_, z, a0):
     """
@@ -115,150 +230,6 @@ def compute_D_hat(alpha_hat):
 
     return D_hat
 
-
-
-
-
-# Estimate precision matrices
-def estimate_precision_matrices(sigma_tau_list, lambda_3):
-    """
-    Estimate time-varying precision matrices Ω(tau) for each time point tau.
-
-    Parameters:
-    - sigma_tau_list: List of (d × d) covariance matrices Σ(tau) for each time point.
-    - lambda_3: Tuning parameter for CLIME.
-
-    Returns:
-    - omega_tau_list: List of (d × d) precision matrices Ω(tau) for each time point.
-    """
-    omega_tau_list = []
-
-    # Loop over each covariance matrix Σ(tau)
-    for Sigma_tau in sigma_tau_list:
-        # Estimate the precision matrix Ω(tau)
-        Omega_hat = clime_estimation(Sigma_tau, lambda_3)
-        omega_tau_list.append(Omega_hat)
-    
-    return omega_tau_list
-
-# Symmetrize precision matrix
-def symmetrize_precision_matrix(Omega_tau):
-    """
-    Symmetrize the estimated precision matrix Ω(tau).
-
-    Parameters:
-    - Omega_tau: The estimated precision matrix Ω(tau) (d × d).
-
-    Returns:
-    - Omega_sym: The symmetrized precision matrix (d × d).
-    """
-    d = Omega_tau.shape[0]
-    Omega_sym = np.zeros((d, d))
-
-    # Apply the symmetrization rule for each element
-    for i in range(d):
-        for j in range(d):
-            if np.abs(Omega_tau[i, j]) <= np.abs(Omega_tau[j, i]):
-                Omega_sym[i, j] = Omega_tau[i, j]
-            else:
-                Omega_sym[i, j] = Omega_tau[j, i]
-    
-    return Omega_sym
-
-# Symmertrize all precision matrices
-def symmetrize_all_precision_matrices(omega_tau_list):
-    """
-    Symmetrize all precision matrices Ω(tau) for each time point.
-
-    Parameters:
-    - omega_tau_list: List of (d × d) precision matrices Ω(tau) for each time point.
-
-    Returns:
-    - omega_sym_list: List of (d × d) symmetrized precision matrices.
-    """
-    omega_sym_list = [symmetrize_precision_matrix(Omega_tau) for Omega_tau in omega_tau_list]
-    return omega_sym_list
-
-# Select lag order
-def select_lag(kmax, n, d, alpha_estimates):
-   # Example usage
-   # Assuming A_bt is a 3D array (n_time_points, d, d) containing the estimated transition matrices
-   A_bt = np.random.randn(n, d, d)  # Simulated transition matrices
-
-   # Set user-specified parameters
-   xi_A = 0.1
-
-   # Select the optimal lag order
-   optimal_k, R_values = select_optimal_k(A_bt, kmax, xi_A)
-
-   print("Optimal lag order:", optimal_k)
-   print("R(k) values:", R_values)
-
-# Frobenius norm
-def frobenius_norm(A):
-    return np.linalg.norm(A, 'fro')
-
-# Function to compute R(k) for a given k
-def compute_R_k(k, A_bt, kmax, xi_A):
-    """
-    Compute the value of R(k).
-    
-    Parameters:
-    - k: The lag order for which to compute R(k).
-    - A_bt: List of estimated transition matrices for all lags and time points.
-    - kmax: Maximum lag order.
-    - xi_A: User-specified constant (threshold).
-
-    Returns:
-    - R(k): The ratio computed for lag k.
-    """
-    n, d, _ = A_bt.shape  # Assuming A_bt is (n_time_points, d, d) array
-
-    # Numerator: Sum of norms from k to 2kmax
-    numerator = 0
-    for l in range(k, 2*kmax + 1):
-        for t in range(n):
-            A_bt_l_t = A_bt[t, :, :]  # Transition matrix at time t for lag l
-            numerator += frobenius_norm(A_bt_l_t) / xi_A
-    
-    # Denominator: Sum of norms from k+1 to 2kmax
-    denominator = 0
-    for l in range(k + 1, 2*kmax + 1):
-        for t in range(n):
-            A_bt_l_t = A_bt[t, :, :]  # Transition matrix at time t for lag l
-            denominator += frobenius_norm(A_bt_l_t) / xi_A
-    
-    # Compute R(k) as the ratio of the sums
-    R_k = numerator / denominator
-    return R_k
-
-# Function to select the optimal lag order
-def select_optimal_k(A_bt, kmax=10, xi_A=0.1):
-    """
-    Select the optimal lag order that maximizes R(k).
-    
-    Parameters:
-    - A_bt: List of estimated transition matrices for all lags and time points.
-    - kmax: Maximum lag order to consider (default: 10).
-    - xi_A: User-specified constant (default: 0.1).
-
-    Returns:
-    - optimal_k: The lag order that maximizes R(k).
-    - R_values: List of R(k) values for all k.
-    """
-    R_values = []
-
-    # Loop over k from 1 to kmax and compute R(k)
-    for k in range(1, kmax + 1):
-        R_k = compute_R_k(k, A_bt, kmax, xi_A)
-        R_values.append(R_k)
-    
-    # Find the k that maximizes R(k)
-    optimal_k = np.argmax(R_values) + 1  # Add 1 because Python uses 0-based indexing
-    return optimal_k, R_values
-
-
-
 # Print estimated alpha and beta matrices from step 3.2    
 def print_estimated_matrices(alpha_estimates, beta_estimates, tau_t_values):
     """
@@ -277,21 +248,199 @@ def print_estimated_matrices(alpha_estimates, beta_estimates, tau_t_values):
         print(f"estimated alpha (A) matrix at tau = {tau_t_values[t]:.4f}:\n{alpha_estimates[t]}")
         print(f"estimated beta (B) matrix at tau = {tau_t_values[t]:.4f}:\n{beta_estimates[t]}")
 
+# Local linear objective function
+def local_linear_objective(alpha_t, beta_t, Xt_1, xt_i, tau_t, tau, h):
+    """
+    Compute the local linear objective function L_i(alpha, beta | tau).
+
+    Parameters:
+    - alpha_t: Coefficients alpha at time t.
+    - beta_t: Coefficients beta at time t.
+    - Xt_1: Lagged predictor matrix at time t-1.
+    - xt_i: Predictor data at time t for variable i.
+    - tau_t: Current time point.
+    - tau: Reference time point.
+    - bandwidth: Bandwidth for kernel smoothing.
+
+    Returns:
+    - Local linear objective value.
+    """
+    prediction = alpha_t + beta_t * (tau_t - tau)  # Linear prediction
+    loss = np.sum((xt_i - Xt_1 @ prediction) ** 2)  # Squared loss
+    weight = kernel_weights(tau_t, tau, h)  # Get the kernel weight
+    return (1 / len(Xt_1)) * loss * weight
 
 
-# Estimate residuals
-def estimate_residuals_with_estimated_A(X, alpha_estimates, p=1):
+def compute_penalized_objective(preliminary_a, preliminary_b, D_hat, X, Xt_1, tau_t, λ, a0, h, kmax):
+    """
+    Compute the global penalized objective function with weighted group LASSO.
+    
+    Parameters:
+    - preliminary_a: Preliminary alpha estimates (shape: n, d, d).
+    - preliminary_b: Preliminary beta estimates (shape: n, d, d).
+    - D_hat: Pre-computed D_hat matrix.
+    - X: Predictor data (shape: n, d).
+    - Xt_1: Lagged predictor data (shape: n-1, d).
+    - tau_t: Time points (shape: n, 1).
+    - λ: Regularization parameter for SCAD.
+    
+    Returns:
+    - The penalized objective value Q_i(A, B).
+    """
+    n, d = X.shape  # n = number of time points, d = number of variables
+    total_loss = 0
+    total_penalty_alpha = 0
+    total_penalty_beta = 0
+    p=kmax
+    
+    # Initialize estimated estimates for alpha and beta (A and B)
+    alpha_estimates = np.zeros_like(preliminary_a)
+    beta_estimates = np.zeros_like(preliminary_b)
+
+    # Iterate over each time point (excluding the first due to lagged matrix Xt_1)
+    for t in range(n-1):
+        alpha_t = preliminary_a[t]  # alpha estimates at time t (shape: d, d)
+        beta_t = preliminary_b[t]  # beta estimates at time t (shape: d, d)
+        
+        Xt_1_t = Xt_1[t]  # Lagged predictor matrix Xt_1 at time t
+        xt_i = X[t + 1]  # Predictor data at time t (to match Xt_1)
+        
+        # Local linear loss term
+        total_loss += local_linear_objective(alpha_t, beta_t, Xt_1_t, xt_i, tau_t[t + 1], tau_t[t], h)
+    
+        # Refining the estimates of A (alpha) and B (beta) based on SCAD penalty
+        for i in range(d):
+            for j in range(d):
+                # Refine alpha estimates
+                norm_alpha_ij = np.linalg.norm(preliminary_a[:, i, j])
+                penalty_alpha = scad_penalty_derivative(λ, norm_alpha_ij, a0)
+                alpha_estimates[t, i, j] = np.sign(alpha_t[i, j]) * max(0, abs(alpha_t[i, j]) - penalty_alpha)
+
+                # Refine beta estimates with D_hat weighting
+                penalty_beta = scad_penalty_derivative(λ, D_hat[i, j], a0)
+                beta_estimates[t, i, j] = np.sign(beta_t[i, j]) * max(0, abs(beta_t[i, j]) - penalty_beta)
+        
+    # Penalty terms for alpha and beta using SCAD and D_hat
+    for i in range(d):  # Iterate over each variable i
+        for j in range(d):  # Iterate over each variable j (alpha and beta are d × d matrices)
+            # Penalty for alpha
+            norm_alpha_ij = np.linalg.norm(preliminary_a[:, i, j])  # Norm over all time points for alpha_i,j
+            penalty_alpha = scad_penalty_derivative(λ, norm_alpha_ij, a0)
+            total_penalty_alpha += penalty_alpha * norm_alpha_ij
+            
+            # Penalty for beta with D_hat weighting
+            norm_beta_ij = np.linalg.norm(preliminary_b[:, i, j])  # Norm over all time points for beta_i,j
+            penalty_beta = scad_penalty_derivative(λ, D_hat[i, j], a0)
+            total_penalty_beta += penalty_beta * norm_beta_ij
+
+    # Final objective function value (sum of loss and penalties)
+    Q_i = total_loss + total_penalty_alpha + total_penalty_beta
+    
+    # Return the penalized objective and the estimated alpha and beta results
+    return Q_i, alpha_estimates, beta_estimates
+
+# GIC
+def GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h):
+    """
+    Compute the Generalized Information Criterion (GIC) for the given λ2.
+    
+    Parameters:
+    - λ2: Tuning parameter.
+    - X: Response matrix (n × d).
+    - Xt_1: Lagged predictors (n-1 × d).
+    - alpha_hat: Estimated alpha coefficients.
+    - tau_t_values: Normalized time points (n × 1 array).
+    - gamma_n_d: Pre-computed gamma * log(log(n)) * log(36d/(35h)) term.
+    - h: Bandwidth for kernel smoothing.
+    
+    Returns:
+    - GIC value.
+    """
+    
+    n, d = X.shape
+    residuals = []
+
+    for t in range(1, n):
+        xt_i = X[t, :]
+        Xt_1_t = Xt_1[t-1, :]
+        predicted = alpha_hat @ Xt_1_t
+        residuals.append(np.linalg.norm(xt_i - predicted) ** 2)
+    
+    sum_squared_error = np.sum(residuals) / n
+    
+    # Number of selected coefficients (si(λ2))
+    s_i_lambda2 = np.count_nonzero(alpha_hat)
+    
+    # Compute the GIC value based on the given formula
+    GIC_value = np.log(sum_squared_error) + (gamma_n_d / n) * (36 * s_i_lambda2) / (35 * h)
+    
+    return GIC_value
+
+# Find optimal lambda2
+def find_optimal_lambda2(X, Xt_1, alpha_hat, tau_t_values, h, λ2_values, n, d):
+    """
+    Finds the optimal λ2 by first performing a grid search and then refining with minimization.
+    
+    Parameters:
+    - X: (n × d) matrix of observations.
+    - Xt_1: (n-1 × d) matrix of lagged predictors.
+    - alpha_hat: Estimated alpha coefficients from the first step.
+    - tau_t_values: Array of time points (normalized).
+    - h: Bandwidth parameter.
+    - λ2_values: Range of λ2 values for grid search.
+    - n: Number of observations.
+    - d: Number of variables.
+    
+    Returns:
+    - Optimal λ2 and the minimized GIC value.
+    """
+    
+    # Compute γn,d as per the GIC formula
+    gamma = 0.1  # Adjust this value as needed (e.g., 1 for simulation or 0.1 for empirical)
+    gamma_n_d = gamma * np.log(np.log(n)) * np.log(36 * d / (35 * h))
+    
+    # Step 1: Grid Search over λ2
+    best_GIC_value = np.inf
+    best_lambda2 = None
+
+    for λ2 in λ2_values:
+        GIC_value = GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h)
+        
+        if GIC_value < best_GIC_value:
+            best_GIC_value = GIC_value
+            best_lambda2 = λ2
+
+    # Step 2: Refined Optimization using minimize
+    result = minimize(
+        lambda λ2: GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h),
+        best_lambda2,
+        bounds=[(min(λ2_values), max(λ2_values))],
+        method='L-BFGS-B'
+    )
+    
+    optimal_lambda2 = result.x[0]
+    minimized_GIC_value = result.fun
+    
+    print(f"Optimal λ2: {optimal_lambda2}, Minimized GIC value: {minimized_GIC_value}")
+    
+    return optimal_lambda2, minimized_GIC_value
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+# Estimate residuals for a VAR(p) model
+def estimate_residuals_with_estimated_A(X, alpha_estimates, kmax):
     """
     Estimate residuals (errors) e_t for each time point using the estimated transition matrices.
 
     Parameters:
     - X: (n × d) matrix of observations (the original data).
-    - estimated_alpha_results: (n × d × d) matrix of estimated time-varying transition matrices.
-    - p: Number of lags in the model (for simplicity, we assume p = 1).
+    - alpha_estimates: (n × d × d × p) matrix of estimated time-varying transition matrices for each lag.
+    - p: Number of lags in the model.
 
     Returns:
     - residuals: (n, d) matrix of estimated residuals e_t.
     """
+    
+    p=kmax
     n, d = X.shape
     residuals = np.zeros((n, d))
     
@@ -300,9 +449,10 @@ def estimate_residuals_with_estimated_A(X, alpha_estimates, p=1):
         # Initialize predicted_X_t as a zero vector for d variables
         predicted_X_t = np.zeros(d)
         
-        # Compute the predicted value of X_t based on the estimated transition matrix at time t
-        # Using the transition matrix for the current time point
-        predicted_X_t = alpha_estimates[t] @ X[t-1]  # estimated_alpha_results[t] is A(tau_t), X[t-1] is the lagged value
+        # Sum over the p lags
+        for k in range(1, p + 1):
+            # Compute the predicted value using the k-th lag
+            predicted_X_t += alpha_estimates[t, :, :, k-1] @ X[t - k]
         
         # Calculate the residual (error) as the difference between the actual and predicted X_t
         residuals[t] = X[t] - predicted_X_t
@@ -422,7 +572,65 @@ def clime_estimation(Sigma_tau, lambda_3):
     Omega_hat = result.x.reshape((d, d))
     return Omega_hat
 
+# Estimate precision matrices
+def estimate_precision_matrices(sigma_tau_list, lambda_3):
+    """
+    Estimate time-varying precision matrices Ω(tau) for each time point tau.
 
+    Parameters:
+    - sigma_tau_list: List of (d × d) covariance matrices Σ(tau) for each time point.
+    - lambda_3: Tuning parameter for CLIME.
+
+    Returns:
+    - omega_tau_list: List of (d × d) precision matrices Ω(tau) for each time point.
+    """
+    omega_tau_list = []
+
+    # Loop over each covariance matrix Σ(tau)
+    for Sigma_tau in sigma_tau_list:
+        # Estimate the precision matrix Ω(tau)
+        Omega_hat = clime_estimation(Sigma_tau, lambda_3)
+        omega_tau_list.append(Omega_hat)
+    
+    return omega_tau_list
+
+# Symmetrize precision matrix
+def symmetrize_precision_matrix(Omega_tau):
+    """
+    Symmetrize the estimated precision matrix Ω(tau).
+
+    Parameters:
+    - Omega_tau: The estimated precision matrix Ω(tau) (d × d).
+
+    Returns:
+    - Omega_sym: The symmetrized precision matrix (d × d).
+    """
+    d = Omega_tau.shape[0]
+    Omega_sym = np.zeros((d, d))
+
+    # Apply the symmetrization rule for each element
+    for i in range(d):
+        for j in range(d):
+            if np.abs(Omega_tau[i, j]) <= np.abs(Omega_tau[j, i]):
+                Omega_sym[i, j] = Omega_tau[i, j]
+            else:
+                Omega_sym[i, j] = Omega_tau[j, i]
+    
+    return Omega_sym
+
+# Symmertrize all precision matrices
+def symmetrize_all_precision_matrices(omega_tau_list):
+    """
+    Symmetrize all precision matrices Ω(tau) for each time point.
+
+    Parameters:
+    - omega_tau_list: List of (d × d) precision matrices Ω(tau) for each time point.
+
+    Returns:
+    - omega_sym_list: List of (d × d) symmetrized precision matrices.
+    """
+    omega_sym_list = [symmetrize_precision_matrix(Omega_tau) for Omega_tau in omega_tau_list]
+    return omega_sym_list
 
 # EBIC objective function
 def EBIC(lambda_3, omega_tau, sigma_tau, n_e, d):
@@ -528,295 +736,90 @@ def optimize_lambda3(sigma_tau_list, tau_t_values, h, initial_lambda3):
 
     return result.x[0]
 
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+# Select lag order
+def select_lag(kmax, n, d, alpha_estimates):
+   # Example usage
+   # Assuming A_bt is a 3D array (n_time_points, d, d) containing the estimated transition matrices
+   A_bt = np.random.randn(n, d, d)  # Simulated transition matrices
 
+   # Set user-specified parameters
+   xi_A = 0.1
 
-# BIC
-def BIC_i(λ1, alpha_hat, beta_hat, tau, tau_t_values, X, Xt_1, h):
+   # Select the optimal lag order
+   optimal_k, R_values = select_optimal_k(A_bt, kmax, xi_A)
+
+   print("Optimal lag order:", optimal_k)
+   print("R(k) values:", R_values)
+
+# Frobenius norm
+def frobenius_norm(A):
+    return np.linalg.norm(A, 'fro')
+
+# Function to compute R(k) for a given k
+def compute_R_k(k, A_bt, kmax, xi_A):
     """
-    Compute the Bayesian Information Criterion (BIC) for the given estimates of alpha and beta.
+    Compute the value of R(k).
     
     Parameters:
-    - λ1: Tuning parameter for LASSO.
-    - alpha_hat: Estimated alpha coefficients.
-    - beta_hat: Estimated beta coefficients.
-    - tau: Target time point.
-    - tau_t_values: Time points.
-    - X: Response matrix (n × d).
-    - Xt_1: Lagged predictors (n-1 × d).
-    - h: Bandwidth for kernel smoothing.
-    
+    - k: The lag order for which to compute R(k).
+    - A_bt: List of estimated transition matrices for all lags and time points.
+    - kmax: Maximum lag order.
+    - xi_A: User-specified constant (threshold).
+
     Returns:
-    - BIC value.
+    - R(k): The ratio computed for lag k.
     """
-    n, d = X.shape
-    
-    # Compute the effective sample size n_e
-    n_e = effective_sample_size(tau_t_values, tau, h)
-    
-    # Compute the kernel weights for all time points
-    weights = kernel_weights(tau_t_values, tau, h)
-    
-    # Initialize the likelihood term
-    L_i = 0
-    
-    # Compute the likelihood term (L_i)
-    for t in range(n):
-        y_t = X[t, :]
-        predicted = X[t, :] @ np.hstack([alpha_hat, beta_hat * (tau_t_values[t] - tau)])
-        residual = y_t - predicted
-        
-        # Update the likelihood with the weighted residual
-        L_i += np.sum(residual ** 2) * weights[t]
+    n, d, _ = A_bt.shape  # Assuming A_bt is (n_time_points, d, d) array
 
-    # Normalize by the total number of observations
-    L_i /= n
+    # Numerator: Sum of norms from k to 2kmax
+    numerator = 0
+    for l in range(k, 2*kmax + 1):
+        for t in range(n):
+            A_bt_l_t = A_bt[t, :, :]  # Transition matrix at time t for lag l
+            numerator += frobenius_norm(A_bt_l_t) / xi_A
     
-    # Number of non-zero coefficients
-    non_zero_alpha = np.count_nonzero(alpha_hat)
-    non_zero_beta = np.count_nonzero(beta_hat)
+    # Denominator: Sum of norms from k+1 to 2kmax
+    denominator = 0
+    for l in range(k + 1, 2*kmax + 1):
+        for t in range(n):
+            A_bt_l_t = A_bt[t, :, :]  # Transition matrix at time t for lag l
+            denominator += frobenius_norm(A_bt_l_t) / xi_A
     
-    # Compute the BIC
-    BIC_value = np.log(L_i / np.sum(weights[1:])) + ((np.log(n_e) / n_e)) * (non_zero_alpha + non_zero_beta)
-    
-    return BIC_value
+    # Compute R(k) as the ratio of the sums
+    R_k = numerator / denominator
+    return R_k
 
-# Local linear LASSO
-def local_linear_lasso(X, Xt_1, tau, tau_t, h, lambda_1):
+# Function to select the optimal lag order
+def select_optimal_k(A_bt, kmax=10, xi_A=0.1):
     """
-    Perform local linear regression with LASSO regularization.
+    Select the optimal lag order that maximizes R(k).
     
     Parameters:
-    - X: (n × d) matrix of observations (response data).
-    - Xt_1: (n-1 × d) matrix of lagged predictors.
-    - tau: Target time for local regression (scalar in [0, 1]).
-    - tau_t: Normalized time points (n × 1 array).
-    - h: Bandwidth parameter for kernel smoothing.
-    - λ: Regularization parameter for LASSO.
-    
-    Returns:
-    - Estimated alpha and beta parameters for each variable.
-    """
-    n, d = X.shape
-    alpha_results = []  # List to store alpha estimates for each time point
-    beta_results = []  # List to store beta estimates for each time point
-
-    # For each variable i, we will estimate alpha and beta
-    for i in range(d):
-        # Step 1: Create the response vector and the design matrix
-        y = X[1:, i]  # Response vector for variable i (exclude the first row)
-        design_matrix = np.hstack([Xt_1, (tau_t[1:] - tau).reshape(-1, 1) * Xt_1])
-        
-        # Step 2: Calculate kernel weights
-        weights = kernel_weights(tau_t[1:], tau, h)  # Kernel weights for each time point (exclude first)
-        
-        # Step 3: Perform weighted least squares using LASSO
-        weighted_design_matrix = design_matrix * np.sqrt(weights).reshape(-1, 1)
-        weighted_y = y * np.sqrt(weights)
-        
-        # Step 4: Custom LASSO with separate penalties for alpha and beta
-        scaling_factor = np.hstack([np.ones(d), h * np.ones(d)])  # alpha penalized by λ, beta by hλ
-        scaled_design_matrix = weighted_design_matrix / scaling_factor
-        
-        # Step 5: Fit LASSO (L1 regularized linear regression)
-        lasso = Lasso(alpha=lambda_1, fit_intercept=False)
-        lasso.fit(scaled_design_matrix, weighted_y)
-        
-        # Step 6: Extract the coefficients (alpha and beta)
-        alpha = lasso.coef_[:d]  # First d coefficients correspond to alpha
-        beta = lasso.coef_[d:] / h  # Next d coefficients correspond to beta (scaled back by h)
-        
-        # Store the result for the current variable i
-        alpha_results.append(alpha)
-        beta_results.append(beta)
-    
-    return np.array(alpha_results), np.array(beta_results)
-
-
-
-     
-# GIC
-def GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h):
-    """
-    Compute the Generalized Information Criterion (GIC) for the given λ2.
-    
-    Parameters:
-    - λ2: Tuning parameter.
-    - X: Response matrix (n × d).
-    - Xt_1: Lagged predictors (n-1 × d).
-    - alpha_hat: Estimated alpha coefficients.
-    - tau_t_values: Normalized time points (n × 1 array).
-    - gamma_n_d: Pre-computed gamma * log(log(n)) * log(36d/(35h)) term.
-    - h: Bandwidth for kernel smoothing.
-    
-    Returns:
-    - GIC value.
-    """
-    
-    n, d = X.shape
-    residuals = []
-
-    for t in range(1, n):
-        xt_i = X[t, :]
-        Xt_1_t = Xt_1[t-1, :]
-        predicted = alpha_hat @ Xt_1_t
-        residuals.append(np.linalg.norm(xt_i - predicted) ** 2)
-    
-    sum_squared_error = np.sum(residuals) / n
-    
-    # Number of selected coefficients (si(λ2))
-    s_i_lambda2 = np.count_nonzero(alpha_hat)
-    
-    # Compute the GIC value based on the given formula
-    GIC_value = np.log(sum_squared_error) + (gamma_n_d / n) * (36 * s_i_lambda2) / (35 * h)
-    
-    return GIC_value
-
-# Find optimal lambda2
-def find_optimal_lambda2(X, Xt_1, alpha_hat, tau_t_values, h, λ2_values, n, d):
-    """
-    Finds the optimal λ2 by first performing a grid search and then refining with minimization.
-    
-    Parameters:
-    - X: (n × d) matrix of observations.
-    - Xt_1: (n-1 × d) matrix of lagged predictors.
-    - alpha_hat: Estimated alpha coefficients from the first step.
-    - tau_t_values: Array of time points (normalized).
-    - h: Bandwidth parameter.
-    - λ2_values: Range of λ2 values for grid search.
-    - n: Number of observations.
-    - d: Number of variables.
-    
-    Returns:
-    - Optimal λ2 and the minimized GIC value.
-    """
-    
-    # Compute γn,d as per the GIC formula
-    gamma = 0.1  # Adjust this value as needed (e.g., 1 for simulation or 0.1 for empirical)
-    gamma_n_d = gamma * np.log(np.log(n)) * np.log(36 * d / (35 * h))
-    
-    # Step 1: Grid Search over λ2
-    best_GIC_value = np.inf
-    best_lambda2 = None
-
-    for λ2 in λ2_values:
-        GIC_value = GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h)
-        
-        if GIC_value < best_GIC_value:
-            best_GIC_value = GIC_value
-            best_lambda2 = λ2
-
-    # Step 2: Refined Optimization using minimize
-    result = minimize(
-        lambda λ2: GIC_i(λ2, X, Xt_1, alpha_hat, tau_t_values, gamma_n_d, h),
-        best_lambda2,
-        bounds=[(min(λ2_values), max(λ2_values))],
-        method='L-BFGS-B'
-    )
-    
-    optimal_lambda2 = result.x[0]
-    minimized_GIC_value = result.fun
-    
-    print(f"Optimal λ2: {optimal_lambda2}, Minimized GIC value: {minimized_GIC_value}")
-    
-    return optimal_lambda2, minimized_GIC_value
-
-
-
-
-# Local linear objective function
-def local_linear_objective(alpha_t, beta_t, Xt_1, xt_i, tau_t, tau, h):
-    """
-    Compute the local linear objective function L_i(alpha, beta | tau).
-
-    Parameters:
-    - alpha_t: Coefficients alpha at time t.
-    - beta_t: Coefficients beta at time t.
-    - Xt_1: Lagged predictor matrix at time t-1.
-    - xt_i: Predictor data at time t for variable i.
-    - tau_t: Current time point.
-    - tau: Reference time point.
-    - bandwidth: Bandwidth for kernel smoothing.
+    - A_bt: List of estimated transition matrices for all lags and time points.
+    - kmax: Maximum lag order to consider (default: 10).
+    - xi_A: User-specified constant (default: 0.1).
 
     Returns:
-    - Local linear objective value.
+    - optimal_k: The lag order that maximizes R(k).
+    - R_values: List of R(k) values for all k.
     """
-    prediction = alpha_t + beta_t * (tau_t - tau)  # Linear prediction
-    loss = np.sum((xt_i - Xt_1 @ prediction) ** 2)  # Squared loss
-    weight = kernel_weights(tau_t, tau, h)  # Get the kernel weight
-    return (1 / len(Xt_1)) * loss * weight
+    R_values = []
 
-def compute_penalized_objective(preliminary_a, preliminary_b, D_hat, X, Xt_1, tau_t, λ, a0, h):
-    """
-    Compute the global penalized objective function with weighted group LASSO.
+    # Loop over k from 1 to kmax and compute R(k)
+    for k in range(1, kmax + 1):
+        R_k = compute_R_k(k, A_bt, kmax, xi_A)
+        R_values.append(R_k)
     
-    Parameters:
-    - preliminary_a: Preliminary alpha estimates (shape: n, d, d).
-    - preliminary_b: Preliminary beta estimates (shape: n, d, d).
-    - D_hat: Pre-computed D_hat matrix.
-    - X: Predictor data (shape: n, d).
-    - Xt_1: Lagged predictor data (shape: n-1, d).
-    - tau_t: Time points (shape: n, 1).
-    - λ: Regularization parameter for SCAD.
+    # Find the k that maximizes R(k)
+    optimal_k = np.argmax(R_values) + 1  # Add 1 because Python uses 0-based indexing
+    return optimal_k, R_values
+
+# Tests for numerical performance
+def measures(X, A1_tau_list, Omega_tau_list):
+    print("Hoi")
     
-    Returns:
-    - The penalized objective value Q_i(A, B).
-    """
-    n, d = X.shape  # n = number of time points, d = number of variables
-    total_loss = 0
-    total_penalty_alpha = 0
-    total_penalty_beta = 0
-    
-    # Initialize estimated estimates for alpha and beta (A and B)
-    alpha_estimates = np.zeros_like(preliminary_a)
-    beta_estimates = np.zeros_like(preliminary_b)
-
-    # Iterate over each time point (excluding the first due to lagged matrix Xt_1)
-    for t in range(n-1):
-        alpha_t = preliminary_a[t]  # alpha estimates at time t (shape: d, d)
-        beta_t = preliminary_b[t]  # beta estimates at time t (shape: d, d)
-        
-        Xt_1_t = Xt_1[t]  # Lagged predictor matrix Xt_1 at time t
-        xt_i = X[t + 1]  # Predictor data at time t (to match Xt_1)
-        
-        # Local linear loss term
-        total_loss += local_linear_objective(alpha_t, beta_t, Xt_1_t, xt_i, tau_t[t + 1], tau_t[t], h)
-    
-        # Refining the estimates of A (alpha) and B (beta) based on SCAD penalty
-        for i in range(d):
-            for j in range(d):
-                # Refine alpha estimates
-                norm_alpha_ij = np.linalg.norm(preliminary_a[:, i, j])
-                penalty_alpha = scad_penalty_derivative(λ, norm_alpha_ij, a0)
-                alpha_estimates[t, i, j] = np.sign(alpha_t[i, j]) * max(0, abs(alpha_t[i, j]) - penalty_alpha)
-
-                # Refine beta estimates with D_hat weighting
-                penalty_beta = scad_penalty_derivative(λ, D_hat[i, j], a0)
-                beta_estimates[t, i, j] = np.sign(beta_t[i, j]) * max(0, abs(beta_t[i, j]) - penalty_beta)
-        
-    # Penalty terms for alpha and beta using SCAD and D_hat
-    for i in range(d):  # Iterate over each variable i
-        for j in range(d):  # Iterate over each variable j (alpha and beta are d × d matrices)
-            # Penalty for alpha
-            norm_alpha_ij = np.linalg.norm(preliminary_a[:, i, j])  # Norm over all time points for alpha_i,j
-            penalty_alpha = scad_penalty_derivative(λ, norm_alpha_ij, a0)
-            total_penalty_alpha += penalty_alpha * norm_alpha_ij
-            
-            # Penalty for beta with D_hat weighting
-            norm_beta_ij = np.linalg.norm(preliminary_b[:, i, j])  # Norm over all time points for beta_i,j
-            penalty_beta = scad_penalty_derivative(λ, D_hat[i, j], a0)
-            total_penalty_beta += penalty_beta * norm_beta_ij
-
-    # Final objective function value (sum of loss and penalties)
-    Q_i = total_loss + total_penalty_alpha + total_penalty_beta
-    
-    # Return the penalized objective and the estimated alpha and beta results
-    return Q_i, alpha_estimates, beta_estimates
-
-
-
-
-
-
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 # Simulate VAR(1) data as in example 1 of CLIME paper
 def simulate_var1_example1(n, d, tau_t_values):
     """
@@ -829,6 +832,8 @@ def simulate_var1_example1(n, d, tau_t_values):
     
     Returns:
     - X: Simulated VAR(1) data of shape (n, d).
+    - A1_tau_diag: Time-varying diagonal A(τ) matrices used for simulation.
+    - Omega_tau_list: Time-varying Omega(τ) matrices used for simulation.
     """
 
     if d % 2 != 0:
@@ -897,7 +902,9 @@ def simulate_var1_example2(n, d, tau_t_values):
 
     # Initialize the data matrix X
     X = np.zeros((n, d))
-
+    A1_tau_list = []
+    Omega_tau_list = []
+    
     # Loop through each time point
     for t in range(1, n):
         tau = tau_t_values[t]
@@ -910,6 +917,7 @@ def simulate_var1_example2(n, d, tau_t_values):
             if i < d - 1:
                 # Super-diagonal entry
                 A1_tau[i, i + 1] = 0.7 - 0.7 * norm.cdf(5 * (tau - 0.5))
+        A1_tau_list.append(A1_tau)
 
         # Generate time-varying noise epsilon_t
         Omega_tau = np.eye(d)
@@ -920,6 +928,7 @@ def simulate_var1_example2(n, d, tau_t_values):
         for i in range(d - 2):
             Omega_tau[i, i + 2] = 0.7 - 0.7 * norm.cdf(5 * (tau - 0.5))
             Omega_tau[i + 2, i] = Omega_tau[i, i + 2]  # Symmetry
+        Omega_tau_list.append(Omega_tau)
 
         # Sample epsilon_t from the multivariate normal with covariance Omega_tau
         epsilon_t = np.random.multivariate_normal(np.zeros(d), Omega_tau)
@@ -927,7 +936,7 @@ def simulate_var1_example2(n, d, tau_t_values):
         # Update X_t based on X_(t-1)
         X[t] = A1_tau @ X[t - 1] + epsilon_t
 
-    return X
+    return X, A1_tau_list, Omega_tau_list
 
 # Simulate VAR(1) data as in example 3 of CLIME paper
 def simulate_var1_example3(n, d, tau_t_values):
@@ -945,7 +954,9 @@ def simulate_var1_example3(n, d, tau_t_values):
 
     # Initialize the data matrix
     X = np.zeros((n, d))
-
+    A1_tau_list = []
+    Omega_tau_list = []
+    
     # Simulate A1(τ) and Ω(τ) at each time point τ
     for t in range(1, n):
         tau = tau_t_values[t]
@@ -955,12 +966,14 @@ def simulate_var1_example3(n, d, tau_t_values):
         for i in range(d):
             for j in range(d):
                 A1_tau[i, j] = (0.4 - 0.1 * tau)**(abs(i - j) + 1)
-        
+        A1_tau_list.append(A1_tau)
+
         # Ω(τ) is a Toeplitz matrix with entries ω_ij(τ) = (0.8 - 0.1τ)^|i-j|
         Omega_tau = np.zeros((d, d))
         for i in range(d):
             for j in range(d):
                 Omega_tau[i, j] = (0.8 - 0.1 * tau)**abs(i - j)
+        Omega_tau_list.append(Omega_tau)
 
         # Generate multivariate normal noise with covariance matrix Ω(τ)^(-1)
         Sigma_tau = np.linalg.inv(Omega_tau)
@@ -969,9 +982,9 @@ def simulate_var1_example3(n, d, tau_t_values):
         # Generate the data at time t using the VAR(1) model
         X[t, :] = A1_tau @ X[t - 1, :] + epsilon_t
 
-    return X
+    return X, A1_tau_list, Omega_tau_list
 
-''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 # First step
 def firstStep(X, λ_values, tau_t_values, h):
@@ -1003,7 +1016,7 @@ def firstStep(X, λ_values, tau_t_values, h):
                 
         # Now use the best estimates from the grid search for optimization
         # Use bounds to ensure the optimization searches for a better λ1
-        bounds = [(0.01, 1)]  # Adjust bounds if needed
+        bounds = [(0.01, 100)]  # Adjust bounds if needed
         result = minimize(BIC_i, best_lambda, args=(best_alpha_hat, best_beta_hat, tau, tau_t_values, X, Xt_1, h), bounds=bounds)
             
         optimal_lambda_1 = result.x[0]  # Get the optimized λ1
@@ -1029,7 +1042,7 @@ def firstStep(X, λ_values, tau_t_values, h):
     return preliminary_a, preliminary_b, optimal_lambda_1_results, Xt_1
 
 # Second step
-def secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0, λ_values):
+def secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0, λ_values, kmax):
     
     # Compute D_hat based on the preliminary alpha estimates
     D_hat = compute_D_hat(preliminary_a)
@@ -1040,7 +1053,7 @@ def secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0,
     
     # Compute the penalized objective function with the optimal λ2
     Q_i, alpha_estimates, beta_estimates = compute_penalized_objective(
-        preliminary_a, preliminary_b, D_hat, X, Xt_1, tau_t_values, optimal_lambda2, a0, h)
+        preliminary_a, preliminary_b, D_hat, X, Xt_1, tau_t_values, optimal_lambda2, a0, h, p=kmax)
     
     # Output the final penalized objective value and estimated transition matrices
     print("Penalized Objective Q_i:", Q_i)
@@ -1049,8 +1062,8 @@ def secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0,
     return alpha_estimates, beta_estimates
 
 # Third step
-def thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values):
-    residuals = estimate_residuals_with_estimated_A(X, alpha_estimates, p=1)
+def thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values, kmax):
+    residuals = estimate_residuals_with_estimated_A(X, alpha_estimates, p=kmax)
 
     # Print the shape and first few residuals for inspection
     print("Shape of residuals:", residuals.shape)
@@ -1082,55 +1095,48 @@ def thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values):
     return omega_sym_list
 
 
-
-
-
 # Main
 def main():
 
     # Define parameters
-    n = 10  # Number of observations
-    d = 4  # Number of variables
+    n = 40  # Number of observations
+    d = 8  # Number of variables
     tau_t_values = np.linspace(0, 1, n) # Create normalized time points tau_t
     h = 0.75 * (np.log(d) / n) ** (1/5) # Bandwidth for kernel as in Li, Ke and Zhang (2015)
     bandwidth = h  # also as in Li, Ke and Zhang (2015).
-    λ_values = np.linspace(0.1, 1, 10)  # Range of λ values for grid search
+    λ_values = np.linspace(0.1, 10, 100)  # Range of λ values for grid search
     a0 = 3.7 # as suggested in Fan and Li (2001)
     kmax = 3 # maximum lag order used for the estimation
 
     simulate = True
     
     # Data used
-    data = 1
+    data = 3
 
     # Simulate the data
     if(simulate == True):
         if(data == 1):
-            X, A1_tau_diag, Omega_tau_list = simulate_var1_example1(n, d, tau_t_values)
+            X, A1_tau_list, Omega_tau_list = simulate_var1_example1(n, d, tau_t_values)
         elif(data == 2):
-            X, A1_tau_diag, Omega_tau_list = simulate_var1_example2(n, d, tau_t_values)
+            X, A1_tau_list, Omega_tau_list = simulate_var1_example2(n, d, tau_t_values)
         elif(data == 3):
-            X, A1_tau_diag, Omega_tau_list = simulate_var1_example3(n, d, tau_t_values)
-        
-    # Print the first few rows of the simulated data
-    print(X[:5])
-
-    sys.exit()
+            X, A1_tau_list, Omega_tau_list = simulate_var1_example3(n, d, tau_t_values)
     
     '''
     3.1: Preliminary time-varying LASSO estimation
     '''
     preliminary_a, preliminary_b, optimal_lambda_1_results, Xt_1 = firstStep(X, λ_values, tau_t_values, h)
+    sys.exit()
     
     '''
     3.2: Penalised local linear estimation with weighted group LASSO
     '''
-    alpha_estimates, beta_estimates = secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0, λ_values)
+    alpha_estimates, beta_estimates = secondStep(preliminary_a, h, n, d, X, Xt_1, tau_t_values, preliminary_b, a0, λ_values, kmax)
 
     '''
     3.3: Estimation of the time-varying precision matrix
     '''
-    estimatedPrecisionMatrices = thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values)
+    estimatedPrecisionMatrices = thirdStep(X, alpha_estimates, tau_t_values, bandwidth, λ_values, kmax)
     
     print(estimatedPrecisionMatrices)
 
@@ -1138,7 +1144,8 @@ def main():
     Select lag order
     '''
     select_lag(kmax, n, d, alpha_estimates)
-   
+    measures(X, A1_tau_list, Omega_tau_list)
+    
 #################################################################################################
 ### Call main
 if __name__ == "__main__":

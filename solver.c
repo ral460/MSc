@@ -1,3 +1,4 @@
+//Imports
 #include <math.h>
 #include <string.h>
 #include "Rinternals.h"
@@ -28,10 +29,10 @@ SEXP cleanupRawG(double *a, double *v, double *u, int *active, SEXP beta, SEXP l
   return(res);
 }
 
-// Group-wise Coordinate descent for gaussian models
+// Solver function
 SEXP rawfit_glasso(SEXP X_, SEXP y_, SEXP INIT_, SEXP n_est_, SEXP R_, SEXP maxeigen_, SEXP lambda, SEXP eps_, SEXP max_iter_, SEXP multiplier, SEXP alpha_) {
 
-  // Declarations: Outcome
+  // Initialize variables
   int const n_est = INTEGER(n_est_)[0];
   int const n_y = length(y_);
   int const n = n_y/n_est;
@@ -46,10 +47,9 @@ SEXP rawfit_glasso(SEXP X_, SEXP y_, SEXP INIT_, SEXP n_est_, SEXP R_, SEXP maxe
   PROTECT(resid = allocVector(REALSXP, n_y));
   INTEGER(iter)[0] = 0;
   
-  // Declarations
   double *X = REAL(X_);
   double *y = REAL(y_);
-  double *A = Calloc(p_design, double); // BETA from previous iteration
+  double *A = Calloc(p_design, double);
   for (int j=0; j<p_design; j++) A[j]=REAL(INIT_)[j];
   double lam = REAL(lambda)[0];
   double eps = REAL(eps_)[0];
@@ -64,7 +64,7 @@ SEXP rawfit_glasso(SEXP X_, SEXP y_, SEXP INIT_, SEXP n_est_, SEXP R_, SEXP maxe
     }
   }
 
-  // Setup R, v, Z
+  // Compute R,v,z
   double *R = REAL(resid);
   for (int i=0; i<n_y; i++) R[i] = y[i];    
   for (int j=0; j<p; j++) {
@@ -106,13 +106,13 @@ SEXP rawfit_glasso(SEXP X_, SEXP y_, SEXP INIT_, SEXP n_est_, SEXP R_, SEXP maxe
             }
           } 
         }
-      } //End for
+      }
         
-      // Check for convergence
+      // Check convergence
       for (int j=0; j<p_design; j++) A[j] = B[j]; 
       if (maxChange < eps*sdy) break;
-    } //End While
-    // Scan for violations
+    }
+    // Violations
     int violations = 0;
     for (int j=0; j<p; j++) {
         double normUB = 0;
@@ -138,7 +138,7 @@ SEXP rawfit_glasso(SEXP X_, SEXP y_, SEXP INIT_, SEXP n_est_, SEXP R_, SEXP maxe
 
     if (violations==0) break;
   }
-  REAL(loss)[0] = gLoss(R, n); // CHECK HERE
+  REAL(loss)[0] = gLoss(R, n);
   res = cleanupRawG(A, v, U, active, BETA, loss, iter, resid);
   UNPROTECT(4);
   return(res);
